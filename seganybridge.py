@@ -31,6 +31,7 @@ import time
 import torch
 import numpy as np
 import cv2
+from PIL import Image
 
 # SAM2 imports
 from sam2.build_sam import build_sam2
@@ -43,6 +44,14 @@ from segment_anything import (
     SamAutomaticMaskGenerator as SamAutomaticMaskGenerator_SAM1,
     SamPredictor,
 )
+
+# SAM3 is intentionally NOT imported eagerly like SAM1/SAM2 above. Unlike
+# those two (which LazyGimp always installs together, cheaply, so an eager
+# import never fails), the `sam3` package is a heavy, separate opt-in
+# dependency: Python 3.12+, a gated Hugging Face checkpoint the user must be
+# individually approved for, and typically a real GPU. Forcing it on every
+# SAM1/SAM2 invocation would break the common case for an uncommon one, so
+# it's imported lazily inside SAM3Strategy with a clear error if missing.
 
 # --- Progress reporting ----------------------------------------------------
 #
@@ -426,6 +435,113 @@ class SAM2Strategy(SegmentationStrategy):
             print(f"Removed temporary file: {self._temp_pth_path}")
 
 
+class SAM3Strategy(SegmentationStrategy):
+    """SAM3 ("Segment Anything with Concepts", facebookresearch/sam3) is a
+    fundamentally different tool from SAM1/2: instead of points/boxes on ONE
+    object, you give it a short noun phrase (e.g. "car") and it finds every
+    matching instance in the image. There is no "Auto" grid-search mode and
+    no per-model size variants — Meta ships a single checkpoint.
+
+    The checkpoint is not a lone .pth file but a gated Hugging Face snapshot
+    (several files). `build_sam3_image_model()` takes no path argument at
+    all in the upstream API — it resolves the model from the ambient HF
+    cache/auth, which is exactly why our installer's job for SAM3 is to run
+    `huggingface_hub` login + snapshot_download with the user's access
+    token, not to hand this bridge a checkpoint path to open directly.
+    """
+
+    def get_model_type_from_filename(self, model_filename):
+        return "sam3"
+
+    def load_model(self, checkPtFilePath, modelType, device):
+        try:
+            from sam3.model_builder import build_sam3_image_model
+        except ImportError as e:
+            print(
+                "Error: the 'sam3' package isn't installed in this "
+                f"interpreter ({e}). Run the gimpsegany installer's SAM3 "
+                "setup step (pip install -e . from a clone of "
+                "https://github.com/facebookresearch/sam3), then try again."
+            )
+            return None
+        try:
+            model = build_sam3_image_model()
+            model.to(device=device)
+            print(f"SAM3 model loaded successfully on {device}!")
+            return model
+        except Exception as e:
+            print(f"Error loading SAM3 model: {e}")
+            print(
+                "This is most often either (1) no Hugging Face access token "
+                "configured — run the installer's 'Authenticate with "
+                "Hugging Face' step after being approved for "
+                "facebook/sam3.1 — or (2) the checkpoint hasn't been "
+                "downloaded yet."
+            )
+            return None
+
+    def _processor(self, sam):
+        from sam3.model.sam3_image_processor import Sam3Processor
+
+        return Sam3Processor(sam)
+
+    def segment_text(self, sam, pilImage, maskType, textPrompt, saveFileNoExt, formatBinary):
+        processor = self._processor(sam)
+        inference_state = processor.set_image(pilImage)
+        output = processor.set_text_prompt(state=inference_state, prompt=textPrompt)
+        masks = output["masks"]
+        scores = output.get("scores")
+        try:
+            masks = masks.detach().cpu().numpy()
+        except AttributeError:
+            masks = np.asarray(masks)
+        masks = masks.astype(bool)
+        if masks.ndim == 2:
+            masks = masks[None, ...]
+        if maskType == "Single" and len(masks) > 1:
+            best = 0
+            if scores is not None:
+                try:
+                    best = int(np.argmax(np.asarray(scores)))
+                except Exception:
+                    best = 0
+            masks = masks[best : best + 1]
+        print(f"SAM3 found {len(masks)} instance(s) of '{textPrompt}'")
+        saveMasks(list(masks), saveFileNoExt, formatBinary)
+
+    # Box/Selection prompting is documented as supported by SAM3's processor
+    # (see the SAM1/2-parity notebooks in the upstream repo), but the exact
+    # method name isn't confirmed at the time of writing — rather than guess
+    # and risk a confusing failure, these clearly signpost what to do.
+    def segment_box(self, sam, cvImage, maskType, boxCos, saveFileNoExt, formatBinary):
+        raise NotImplementedError(
+            "SAM3 'Box' mode isn't wired up yet in this bridge — use "
+            "Segmentation Type 'Text' with a short phrase instead "
+            "(e.g. \"car\"). See github.com/facebookresearch/sam3 examples "
+            "for the box-prompt API if you want to add it."
+        )
+
+    def segment_sel(
+        self, sam, cvImage, maskType, selFile, boxCos, saveFileNoExt, formatBinary
+    ):
+        raise NotImplementedError(
+            "SAM3 'Selection' mode isn't wired up yet in this bridge — use "
+            "Segmentation Type 'Text' with a short phrase instead."
+        )
+
+    def segment_auto(self, sam, cvImage, saveFileNoExt, formatBinary, **kwargs):
+        raise NotImplementedError(
+            "SAM3 has no grid-search 'Auto' mode — use Segmentation Type "
+            "'Text' with a short phrase describing what to segment."
+        )
+
+    def run_test(self, sam):
+        img = Image.new("RGB", (64, 64), (255, 255, 255))
+        processor = self._processor(sam)
+        state = processor.set_image(img)
+        processor.set_text_prompt(state=state, prompt="square")
+
+
 def main():
     if len(sys.argv) < 3:
         print(
@@ -436,9 +552,11 @@ def main():
     t_start = time.time()
     modelType = sys.argv[1]
     checkPtFilePath = sys.argv[2]
-    model_filename = os.path.basename(checkPtFilePath)
+    model_filename = os.path.basename(checkPtFilePath.rstrip(os.sep))
 
-    if model_filename.lower().startswith("sam_"):
+    if model_filename.lower() == "sam3" or modelType.lower() == "sam3":
+        strategy = SAM3Strategy()
+    elif model_filename.lower().startswith("sam_"):
         strategy = SAM1Strategy()
     elif model_filename.lower().startswith("sam2"):
         strategy = SAM2Strategy()
@@ -446,7 +564,10 @@ def main():
         print(
             f"Error: Could not determine model family from filename: {model_filename}"
         )
-        print("Filename must start with 'sam_' for SAM1 or 'sam2' for SAM2.")
+        print(
+            "Filename must start with 'sam_' for SAM1, 'sam2' for SAM2, or "
+            "be a folder named 'sam3' for SAM3."
+        )
         return
 
     if modelType.lower() == "auto":
@@ -559,6 +680,21 @@ def main():
             with heartbeat("segmenting box"):
                 strategy.segment_box(
                     sam, cvImage, maskType, boxCos, saveFileNoExt, formatBinary
+                )
+        elif segType == "Text":
+            textPrompt = sys.argv[8] if len(sys.argv) > 8 else ""
+            if not textPrompt.strip():
+                print('Error: "Text" segmentation type needs a non-empty prompt.')
+                return
+            stage("segmenting")
+            with heartbeat(f'segmenting concept "{textPrompt}"'):
+                strategy.segment_text(
+                    sam,
+                    Image.fromarray(cvImage),
+                    maskType,
+                    textPrompt,
+                    saveFileNoExt,
+                    formatBinary,
                 )
         else:
             print(f"Unknown segmentation type: {segType}")

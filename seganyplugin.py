@@ -47,19 +47,31 @@ from gi.repository import Gtk
 LAZYGIMP_BACKEND_DIR = os.path.expanduser("~/.local/share/lazygimp/segany")
 
 MODEL_FRIENDLY_LABELS = {
-    "sam_vit_b_01ec64": "SAM1 · vit_b — leggero, veloce su CPU",
-    "sam_vit_l_0b3195": "SAM1 · vit_l — bilanciato (consigliato)",
-    "sam_vit_h_4b8939": "SAM1 · vit_h — qualità massima, lento su CPU",
-    "sam2_hiera_tiny": "SAM2 · tiny — sperimentale",
-    "sam2_hiera_small": "SAM2 · small — sperimentale",
-    "sam2_hiera_base_plus": "SAM2 · base+ — sperimentale",
-    "sam2_hiera_large": "SAM2 · large — sperimentale, pesante",
+    "sam_vit_b_01ec64": "SAM1 · vit_b — lightest, fastest on CPU",
+    "sam_vit_l_0b3195": "SAM1 · vit_l — balanced (recommended)",
+    "sam_vit_h_4b8939": "SAM1 · vit_h — best quality, slow on CPU",
+    "sam2_hiera_tiny": "SAM2 · tiny",
+    "sam2_hiera_small": "SAM2 · small",
+    "sam2_hiera_base_plus": "SAM2 · base+",
+    "sam2_hiera_large": "SAM2 · large",
+    "sam3": "SAM3 · concept segmentation (text prompts, needs a GPU + HF access)",
 }
+
+# SAM3 is a text-prompted "concept segmentation" model rather than a
+# point/box automatic-mask generator like SAM1/2, and its checkpoint is a
+# gated Hugging Face snapshot directory (several files), not a single .pth.
+# We recognise it by this sentinel folder name inside the backend's models/
+# directory rather than by a file extension.
+SAM3_MODEL_DIRNAME = "sam3"
 
 
 def discover_lazygimp_backend():
     """Return (python_path_or_None, [checkpoint paths...]) from the LazyGimp
-    managed backend directory, if it exists. Never raises."""
+    managed backend directory, if it exists. Never raises.
+
+    Entries are either a single checkpoint FILE (SAM1/SAM2, .pth/.pt/
+    .safetensors) or a DIRECTORY (SAM3's gated Hugging Face snapshot, which
+    is several files, not one)."""
     python_path = None
     models = []
     try:
@@ -69,14 +81,23 @@ def discover_lazygimp_backend():
         models_dir = os.path.join(LAZYGIMP_BACKEND_DIR, "models")
         if os.path.isdir(models_dir):
             for fname in sorted(os.listdir(models_dir)):
+                fpath = os.path.join(models_dir, fname)
                 if fname.lower().endswith((".pth", ".pt", ".safetensors")):
-                    models.append(os.path.join(models_dir, fname))
+                    models.append(fpath)
+                elif fname == SAM3_MODEL_DIRNAME and os.path.isdir(fpath) and os.listdir(fpath):
+                    models.append(fpath)
     except OSError as e:
         logging.info("LazyGimp backend discovery failed: %s", e)
     return python_path, models
 
 
+def is_sam3_path(path):
+    return path is not None and os.path.basename(path.rstrip("/")) == SAM3_MODEL_DIRNAME
+
+
 def model_friendly_label(path):
+    if is_sam3_path(path):
+        return MODEL_FRIENDLY_LABELS["sam3"]
     stem = os.path.splitext(os.path.basename(path))[0]
     label = MODEL_FRIENDLY_LABELS.get(stem)
     return f"{label}  ({os.path.basename(path)})" if label else os.path.basename(path)
@@ -102,6 +123,9 @@ class DialogValue:
         # mask post-processing/upscaling, so this remains a useful knob for
         # power users — see seganybridge.py for the actual math.
         self.maxAutoDim = 1024
+        # SAM3 is a text-prompted "concept" segmenter, not a point/box model
+        # like SAM1/2 — this is the noun phrase it looks for (e.g. "car").
+        self.textPrompt = ""
 
         try:
             with open(filepath, "r") as f:
@@ -118,6 +142,7 @@ class DialogValue:
                 self.cropNLayers = data.get("cropNLayers", self.cropNLayers)
                 self.minMaskArea = data.get("minMaskArea", self.minMaskArea)
                 self.maxAutoDim = data.get("maxAutoDim", self.maxAutoDim)
+                self.textPrompt = data.get("textPrompt", self.textPrompt)
         except Exception as e:
             logging.info("Error reading json : %s" % e)
 
@@ -135,6 +160,7 @@ class DialogValue:
             "cropNLayers": self.cropNLayers,
             "minMaskArea": self.minMaskArea,
             "maxAutoDim": self.maxAutoDim,
+            "textPrompt": self.textPrompt,
         }
         with open(filepath, "w") as f:
             json.dump(data, f)
@@ -185,9 +211,9 @@ class OptionsDialog(Gtk.Dialog):
         self.noModelHintLbl = Gtk.Label(xalign=0)
         self.noModelHintLbl.set_line_wrap(True)
         self.noModelHintLbl.set_markup(
-            "<small>Nessun modello trovato automaticamente. Installane uno con "
-            "LazyGimp, oppure specifica i percorsi qui sotto in "
-            "<b>Modalità Esperto</b>.</small>"
+            "<small>No model found automatically. Install one with the "
+            "gimpsegany installer (or LazyGimp), or set the paths manually "
+            "below in <b>Expert Mode</b>.</small>"
         )
 
         self._populate_model_combo()
@@ -198,14 +224,25 @@ class OptionsDialog(Gtk.Dialog):
         grid.attach(self.noModelHintLbl, 0, row, 2, 1)
         row += 1
 
+        # Text Prompt — only meaningful for SAM3 (a concept segmenter: it
+        # looks for every instance of a noun phrase, e.g. "car" or "person
+        # wearing a red hat"), hidden entirely for SAM1/SAM2 models.
+        self.textPromptLbl = Gtk.Label(label="Text Prompt:", xalign=1)
+        self.textPromptEntry = Gtk.Entry()
+        self.textPromptEntry.set_text(self.values.textPrompt)
+        self.textPromptEntry.set_placeholder_text("e.g. \"car\", \"red flower\"")
+        grid.attach(self.textPromptLbl, 0, row, 1, 1)
+        grid.attach(self.textPromptEntry, 1, row, 1, 1)
+        row += 1
+
         # Segmentation Type
-        segTypeLbl = Gtk.Label(label="Segmentation Type:", xalign=1)
+        self.segTypeLbl = Gtk.Label(label="Segmentation Type:", xalign=1)
         self.segTypeDropDown = Gtk.ComboBoxText()
         self.segTypeVals = ["Auto", "Box", "Selection"]
         for value in self.segTypeVals:
             self.segTypeDropDown.append_text(value)
         self.segTypeDropDown.set_active(self.segTypeVals.index(self.values.segType))
-        grid.attach(segTypeLbl, 0, row, 1, 1)
+        grid.attach(self.segTypeLbl, 0, row, 1, 1)
         grid.attach(self.segTypeDropDown, 1, row, 1, 1)
         row += 1
 
@@ -250,7 +287,7 @@ class OptionsDialog(Gtk.Dialog):
         # override, and the numeric SAM2/SAM1 auto-segmentation tuning that
         # only matters to someone who already knows what it does.
         # ------------------------------------------------------------------
-        self.expertExpander = Gtk.Expander(label="Modalità Esperto")
+        self.expertExpander = Gtk.Expander(label="Expert Mode")
         outer.add(self.expertExpander)
 
         egrid = Gtk.Grid()
@@ -284,6 +321,7 @@ class OptionsDialog(Gtk.Dialog):
             "sam2_hiera_base_plus (SAM2)",
             "sam2_hiera_small (SAM2)",
             "sam2_hiera_tiny (SAM2)",
+            "sam3 (SAM3)",
         ]
         for value in self.modelTypeVals:
             self.modelTypeDropDown.append_text(value)
@@ -296,15 +334,17 @@ class OptionsDialog(Gtk.Dialog):
         egrid.attach(self.modelTypeDropDown, 1, erow, 1, 1)
         erow += 1
 
-        checkPtFileLbl = Gtk.Label(
+        self.checkPtFileLbl = Gtk.Label(
             label="Model Checkpoint (.pth/.safetensors):", xalign=1
         )
         self.checkPtFileBtn = Gtk.FileChooserButton(
             title="Select Model Checkpoint Path"
         )
         if self.values.checkPtPath is not None:
+            if is_sam3_path(self.values.checkPtPath):
+                self.checkPtFileBtn.set_action(Gtk.FileChooserAction.SELECT_FOLDER)
             self.checkPtFileBtn.set_filename(self.values.checkPtPath)
-        egrid.attach(checkPtFileLbl, 0, erow, 1, 1)
+        egrid.attach(self.checkPtFileLbl, 0, erow, 1, 1)
         egrid.attach(self.checkPtFileBtn, 1, erow, 1, 1)
         erow += 1
 
@@ -332,7 +372,7 @@ class OptionsDialog(Gtk.Dialog):
         egrid.attach(self.minMaskAreaEntry, 1, erow, 1, 1)
         erow += 1
 
-        self.maxAutoDimLbl = Gtk.Label(label="Max resolution for Auto (0 = nessun limite):", xalign=1)
+        self.maxAutoDimLbl = Gtk.Label(label="Max resolution for Auto (0 = no limit):", xalign=1)
         self.maxAutoDimSpin = Gtk.SpinButton()
         self.maxAutoDimSpin.set_range(0, 8192)
         self.maxAutoDimSpin.set_increments(128, 512)
@@ -353,6 +393,15 @@ class OptionsDialog(Gtk.Dialog):
         if not self.isGrayScale:
             self.randColBtn.connect("toggled", self.on_random_toggled)
 
+        # The combo's initial selection was set inside _populate_model_combo()
+        # *before* the "changed" signal above existed, so it never actually
+        # copied its selection into the Expert-mode checkpoint/python fields.
+        # Do that sync once now that every widget involved exists.
+        if self._model_paths:
+            self.on_model_combo_changed(self.modelCombo)
+        else:
+            self.update_options_visibility(None)
+
         self.show_all()
 
     def _populate_model_combo(self):
@@ -361,7 +410,7 @@ class OptionsDialog(Gtk.Dialog):
         current_is_discovered = current in self._discovered_models
 
         if current and not current_is_discovered:
-            self.modelCombo.append_text(f"Attuale: {os.path.basename(current)}")
+            self.modelCombo.append_text(f"Current: {os.path.basename(current.rstrip('/'))}")
             self._model_paths.append(current)
 
         for path in self._discovered_models:
@@ -384,8 +433,13 @@ class OptionsDialog(Gtk.Dialog):
         if idx < 0 or idx >= len(self._model_paths):
             return
         path = self._model_paths[idx]
+        if is_sam3_path(path):
+            self.checkPtFileBtn.set_action(Gtk.FileChooserAction.SELECT_FOLDER)
+            self.modelTypeDropDown.set_active(self.modelTypeVals.index("sam3 (SAM3)"))
+        else:
+            self.checkPtFileBtn.set_action(Gtk.FileChooserAction.OPEN)
+            self.modelTypeDropDown.set_active(0)  # "Auto" — inferred from filename
         self.checkPtFileBtn.set_filename(path)
-        self.modelTypeDropDown.set_active(0)  # "Auto" — inferred from filename
         if not self.pythonFileBtn.get_filename() and self._discovered_python:
             self.pythonFileBtn.set_filename(self._discovered_python)
         self.update_options_visibility(None)
@@ -405,13 +459,30 @@ class OptionsDialog(Gtk.Dialog):
         isSam1_by_type = "(SAM1)" in modelType
         isSam1 = isSam1_by_filename or isSam1_by_type
 
-        self.selPtsLbl.set_visible(segType in ["Selection"])
-        self.selPtsEntry.set_visible(segType in ["Selection"])
-        self.maskTypeLbl.set_visible(segType not in ["Auto"])
-        self.maskTypeDropDown.set_visible(segType not in ["Auto"])
+        isSam3 = "(SAM3)" in modelType or is_sam3_path(checkpoint_path)
 
-        # Both SAM1 and SAM2 honour these now; only hide them outside Auto.
-        show_auto_options = isAuto
+        # SAM3 is a text-prompted concept segmenter, not a point/box/auto
+        # model like SAM1/SAM2 — swap the whole "how do I select" section
+        # for a single text prompt field instead of hiding/showing pieces
+        # of the SAM1/2 workflow that don't apply to it.
+        self.segTypeLbl.set_visible(not isSam3)
+        self.segTypeDropDown.set_visible(not isSam3)
+        self.textPromptLbl.set_visible(isSam3)
+        self.textPromptEntry.set_visible(isSam3)
+        self.checkPtFileLbl.set_text(
+            "Model Folder (SAM3 snapshot):"
+            if isSam3
+            else "Model Checkpoint (.pth/.safetensors):"
+        )
+
+        self.selPtsLbl.set_visible(not isSam3 and segType in ["Selection"])
+        self.selPtsEntry.set_visible(not isSam3 and segType in ["Selection"])
+        self.maskTypeLbl.set_visible(isSam3 or segType not in ["Auto"])
+        self.maskTypeDropDown.set_visible(isSam3 or segType not in ["Auto"])
+
+        # Both SAM1 and SAM2 honour these now; only hide them outside Auto,
+        # and always hide them for SAM3 (they're not part of its API).
+        show_auto_options = isAuto and not isSam3
         self.segResLbl.set_visible(show_auto_options)
         self.segResDropDown.set_visible(show_auto_options)
         self.cropNLayersLbl.set_visible(show_auto_options)
@@ -435,7 +506,9 @@ class OptionsDialog(Gtk.Dialog):
         self.values.pythonPath = self.pythonFileBtn.get_filename()
         self.values.modelType = self.modelTypeVals[self.modelTypeDropDown.get_active()]
         self.values.checkPtPath = self.checkPtFileBtn.get_filename()
-        self.values.segType = self.segTypeVals[self.segTypeDropDown.get_active()]
+        isSam3 = "(SAM3)" in self.values.modelType or is_sam3_path(self.values.checkPtPath)
+        self.values.segType = "Text" if isSam3 else self.segTypeVals[self.segTypeDropDown.get_active()]
+        self.values.textPrompt = self.textPromptEntry.get_text()
         self.values.maskType = self.maskTypeVals[self.maskTypeDropDown.get_active()]
         if hasattr(self, "randColBtn"):
             self.values.isRandomColor = self.randColBtn.get_active()
@@ -656,8 +729,15 @@ def showError(message):
 def validateOptions(image, values):
     if values.checkPtPath is None:
         showError(
-            "Nessun modello Segment Anything configurato. Installane uno con "
-            "LazyGimp oppure impostalo manualmente in Modalità Esperto."
+            "No Segment Anything model configured. Install one with the "
+            "gimpsegany installer (or LazyGimp), or set it manually in "
+            "Expert Mode."
+        )
+        return False
+    if values.segType == "Text" and not (values.textPrompt or "").strip():
+        showError(
+            "Empty text prompt. SAM3 needs a short phrase describing what "
+            "to segment, e.g. \"car\" or \"red flower\"."
         )
         return False
     if values.segType in {"Selection", "Box"}:
@@ -699,7 +779,7 @@ class ProgressDialog(Gtk.Dialog):
     def __init__(self):
         Gtk.Dialog.__init__(
             self,
-            title="Segment Anything — elaborazione in corso",
+            title="Segment Anything — working…",
             transient_for=None,
             flags=Gtk.DialogFlags.MODAL,
         )
@@ -710,7 +790,7 @@ class ProgressDialog(Gtk.Dialog):
         box.set_spacing(10)
         box.set_border_width(14)
 
-        self.label = Gtk.Label(label="Avvio…")
+        self.label = Gtk.Label(label="Starting…")
         self.label.set_line_wrap(True)
         self.label.set_xalign(0)
         box.add(self.label)
@@ -718,7 +798,7 @@ class ProgressDialog(Gtk.Dialog):
         self.bar = Gtk.ProgressBar()
         box.add(self.bar)
 
-        self.add_button("Annulla", Gtk.ResponseType.CANCEL)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
 
         self._pulse_id = GLib.timeout_add(150, self._pulse)
         self.show_all()
@@ -832,6 +912,10 @@ def run_segmentation(image, values):
                 str(values.maxAutoDim),
             ]
         )
+    elif values.segType == "Text":
+        # SAM3: a noun phrase instead of points/boxes — no GIMP selection
+        # needed at all, the whole image is searched for matching concepts.
+        cmd.append(values.textPrompt)
 
     newImage = image.duplicate()
     visLayer = newImage.merge_visible_layers(Gimp.MergeType.CLIP_TO_IMAGE)
@@ -893,8 +977,8 @@ def run_segmentation(image, values):
 
     if returncode != 0:
         showError(
-            "La segmentazione non è riuscita. Controlla la Console degli errori "
-            "di GIMP per i dettagli del bridge Python."
+            "Segmentation failed. Check GIMP's Error Console for details "
+            "from the Python bridge."
         )
         cleanup(filepathPrefix)
         return
@@ -944,6 +1028,7 @@ def values_from_config(config, configFilePath):
     values.cropNLayers = int(prop("crop-n-layers", values.cropNLayers))
     values.minMaskArea = int(prop("min-mask-area", values.minMaskArea))
     values.maxAutoDim = int(prop("max-auto-dim", values.maxAutoDim))
+    values.textPrompt = prop("text-prompt", values.textPrompt)
     try:
         values.isRandomColor = bool(config.get_property("is-random-color"))
     except Exception:
@@ -981,8 +1066,9 @@ class SegAnyPlugin(Gimp.PlugIn):
         flags = GObject.ParamFlags.READWRITE
         procedure.add_string_argument("python-path", "Python path", "Interpreter used to run the bridge (blank = auto-discover)", "", flags)
         procedure.add_string_argument("checkpoint-path", "Checkpoint path", "SAM checkpoint file (blank = auto-discover)", "", flags)
-        procedure.add_string_argument("model-type", "Model type", "auto/vit_h/vit_l/vit_b/sam2_hiera_*", "Auto", flags)
-        procedure.add_string_argument("seg-type", "Segmentation type", "Auto, Box or Selection", "Auto", flags)
+        procedure.add_string_argument("model-type", "Model type", "auto/vit_h/vit_l/vit_b/sam2_hiera_*/sam3", "Auto", flags)
+        procedure.add_string_argument("seg-type", "Segmentation type", "Auto, Box, Selection, or Text (SAM3)", "Auto", flags)
+        procedure.add_string_argument("text-prompt", "Text prompt", "Noun phrase to segment, SAM3 only (e.g. \"car\")", "", flags)
         procedure.add_string_argument("mask-type", "Mask type", "Multiple or Single", "Multiple", flags)
         procedure.add_int_argument("sel-pt-cnt", "Selection points", "Sample points for Selection mode", 1, 1000, 10, flags)
         procedure.add_string_argument("seg-res", "Auto resolution", "Low, Medium or High", "Medium", flags)
