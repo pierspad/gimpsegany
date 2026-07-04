@@ -28,6 +28,15 @@ import sys
 import threading
 import time
 
+# These BLAS-level thread-pool env vars only take effect if set BEFORE
+# numpy/torch/cv2 first touch the underlying OpenBLAS/MKL library, so this
+# has to happen here, ahead of those imports. We only set a value the user
+# hasn't already pinned themselves (e.g. via a shell profile), and we cap
+# it to the actual core count so we don't oversubscribe on shared/CI boxes.
+_CPU_COUNT = os.cpu_count() or 1
+for _env_var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_env_var, str(_CPU_COUNT))
+
 import torch
 import numpy as np
 import cv2
@@ -108,9 +117,21 @@ def pick_device():
     mps = getattr(torch.backends, "mps", None)
     if mps is not None and mps.is_available():
         return torch.device("mps"), "Apple Silicon (MPS)"
-    cpu_count = os.cpu_count() or 1
-    torch.set_num_threads(cpu_count)
-    return torch.device("cpu"), f"CPU ({cpu_count} threads)"
+    torch.set_num_threads(_CPU_COUNT)
+    cv2.setNumThreads(_CPU_COUNT)
+    return torch.device("cpu"), f"CPU ({_CPU_COUNT} threads)"
+
+
+def points_per_batch_for(device):
+    """How many grid points to run through the mask decoder in one forward
+    pass. On GPU, bigger batches keep thousands of cores fed at once — the
+    library default (64) already undersells a modern GPU. On CPU there's no
+    such thing as an idle "core" to feed this way: torch dispatches each
+    matmul to every thread via set_num_threads() above regardless of batch
+    size, so a smaller batch just means lower peak memory with no speed
+    penalty, which matters more on typically memory-constrained CPU boxes.
+    """
+    return 128 if device.type in ("cuda", "mps") else 32
 
 
 # --- Utility Functions ---
@@ -246,6 +267,7 @@ class SAM1Strategy(SegmentationStrategy):
         mask_generator = SamAutomaticMaskGenerator_SAM1(
             sam,
             points_per_side=points_per_side,
+            points_per_batch=points_per_batch_for(kwargs.get("device") or torch.device("cpu")),
             crop_n_layers=kwargs.get("cropNLayers", 0),
             min_mask_region_area=kwargs.get("minMaskArea", 0),
         )
@@ -377,6 +399,7 @@ class SAM2Strategy(SegmentationStrategy):
         mask_generator = SAM2AutomaticMaskGenerator(
             model=sam,
             points_per_side=points_per_side,
+            points_per_batch=points_per_batch_for(kwargs.get("device") or torch.device("cpu")),
             crop_n_layers=kwargs.get("cropNLayers", 0),
             min_mask_region_area=kwargs.get("minMaskArea", 0),
         )
@@ -606,7 +629,7 @@ def main():
 
     try:
         if segType == "Auto":
-            auto_kwargs = {}
+            auto_kwargs = {"device": device}
             if len(sys.argv) > 8:
                 auto_kwargs["segRes"] = sys.argv[8]
             if len(sys.argv) > 9:
