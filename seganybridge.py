@@ -22,11 +22,15 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 """
 
+import contextlib
+import os
+import sys
+import threading
+import time
+
 import torch
 import numpy as np
 import cv2
-import sys
-import os
 
 # SAM2 imports
 from sam2.build_sam import build_sam2
@@ -39,6 +43,66 @@ from segment_anything import (
     SamAutomaticMaskGenerator as SamAutomaticMaskGenerator_SAM1,
     SamPredictor,
 )
+
+# --- Progress reporting ----------------------------------------------------
+#
+# GIMP invokes this script as a subprocess and streams its stdout back to the
+# user, line by line, as it arrives (see seganyplugin.py). Every long-running
+# step below MUST print *something* every few seconds, otherwise the plug-in
+# has nothing to show and the whole thing looks hung even though it is
+# working perfectly fine — this was the single biggest cause of "GIMP froze,
+# nothing ever happens": a multi-minute CPU-bound call with zero stdout.
+
+
+def stage(name):
+    print(f"[stage] {name}", flush=True)
+
+
+@contextlib.contextmanager
+def heartbeat(label, interval=3.0):
+    """Print a progress line every `interval` seconds while a long call runs.
+
+    Runs in a daemon thread so it can report progress even while the main
+    thread is stuck inside a native (C++/torch) call that never returns to
+    the Python interpreter until it's done — those calls still release the
+    GIL for the bulk of their work, so the timer thread keeps ticking.
+    """
+    stop = threading.Event()
+    t0 = time.time()
+
+    def _tick():
+        while not stop.wait(interval):
+            print(f"[progress] {label}: {time.time() - t0:.0f}s elapsed", flush=True)
+
+    t = threading.Thread(target=_tick, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=1)
+        print(f"[progress] {label}: done in {time.time() - t0:.1f}s", flush=True)
+
+
+# --- Device selection --------------------------------------------------------
+#
+# Deliberately generic: NVIDIA (CUDA), AMD (ROCm builds of torch report
+# through the same torch.cuda.* API), Apple Silicon (MPS) and a CPU fallback
+# that is tuned to actually use every core — by default torch sometimes
+# leaves threads on the table in containerized/virtualized environments.
+
+
+def pick_device():
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        return torch.device("cuda"), f"CUDA/ROCm GPU ({name})"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps"), "Apple Silicon (MPS)"
+    cpu_count = os.cpu_count() or 1
+    torch.set_num_threads(cpu_count)
+    return torch.device("cpu"), f"CPU ({cpu_count} threads)"
+
 
 # --- Utility Functions ---
 
@@ -87,14 +151,33 @@ def saveMasks(masks, saveFileNoExt, formatBinary):
         saveMask(filepath, arr, formatBinary)
 
 
+def resizeMaskToOriginal(mask, targetShape):
+    """Nearest-neighbour resize a boolean mask back to (h, w) = targetShape."""
+    h, w = targetShape
+    resized = cv2.resize(
+        mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+    )
+    return resized.astype(bool)
+
+
 # --- Strategy Pattern Implementation ---
+#
+# Segmentation "resolution" for Auto mode is dominated by points_per_side:
+# the automatic mask generator runs one decoder pass PER GRID POINT (32x32 =
+# 1024 decoder calls at the old hardcoded default), so this — not the input
+# image's pixel size — is what makes Auto mode take seconds vs. tens of
+# minutes on a CPU. Both SAM1 and SAM2 share the same generator API, so the
+# same knobs apply to both; previously SAM1 silently ignored the "Resolution"
+# dropdown entirely and always ran the heaviest possible grid.
+POINTS_PER_SIDE_BY_RES = {"Low": 8, "Medium": 16, "High": 32}
+DEFAULT_POINTS_PER_SIDE = POINTS_PER_SIDE_BY_RES["Medium"]
 
 
 class SegmentationStrategy:
     def get_model_type_from_filename(self, model_filename):
         raise NotImplementedError
 
-    def load_model(self, checkPtFilePath, modelType):
+    def load_model(self, checkPtFilePath, modelType, device):
         raise NotImplementedError
 
     def segment_auto(self, sam, cvImage, saveFileNoExt, formatBinary, **kwargs):
@@ -137,18 +220,28 @@ class SAM1Strategy(SegmentationStrategy):
             )
             return None
 
-    def load_model(self, checkPtFilePath, modelType):
+    def load_model(self, checkPtFilePath, modelType, device):
         try:
             sam = sam_model_registry[modelType](checkpoint=checkPtFilePath)
-            print("SAM1 Model loaded successfully!")
+            sam.to(device=device)
+            print(f"SAM1 Model loaded successfully on {device}!")
             return sam
         except Exception as e:
             print(f"Error loading SAM1 model: {e}")
             return None
 
     def segment_auto(self, sam, cvImage, saveFileNoExt, formatBinary, **kwargs):
-        mask_generator = SamAutomaticMaskGenerator_SAM1(sam)
-        masks = mask_generator.generate(cvImage)
+        points_per_side = POINTS_PER_SIDE_BY_RES.get(
+            kwargs.get("segRes"), DEFAULT_POINTS_PER_SIDE
+        )
+        mask_generator = SamAutomaticMaskGenerator_SAM1(
+            sam,
+            points_per_side=points_per_side,
+            crop_n_layers=kwargs.get("cropNLayers", 0),
+            min_mask_region_area=kwargs.get("minMaskArea", 0),
+        )
+        with heartbeat(f"segmenting (grid {points_per_side}x{points_per_side})"):
+            masks = mask_generator.generate(cvImage)
         masks = [mask["segmentation"] for mask in masks]
         saveMasks(masks, saveFileNoExt, formatBinary)
 
@@ -239,7 +332,7 @@ class SAM2Strategy(SegmentationStrategy):
             print(f"Error converting safetensors to pth: {e}")
             return False
 
-    def load_model(self, checkPtFilePath, modelType):
+    def load_model(self, checkPtFilePath, modelType, device):
         model_configs = {
             "sam2_hiera_tiny": "sam2_hiera_t.yaml",
             "sam2_hiera_small": "sam2_hiera_s.yaml",
@@ -258,8 +351,10 @@ class SAM2Strategy(SegmentationStrategy):
                 print("Failed to convert safetensors file")
                 return None
         try:
-            sam = build_sam2(config_file, actual_checkpoint_path)
-            print("SAM2 Model loaded successfully!")
+            sam = build_sam2(
+                config_file, actual_checkpoint_path, device=str(device)
+            )
+            print(f"SAM2 Model loaded successfully on {device}!")
             return sam
         except Exception as e:
             print(f"Error loading SAM2 model: {e}")
@@ -267,18 +362,17 @@ class SAM2Strategy(SegmentationStrategy):
             return None
 
     def segment_auto(self, sam, cvImage, saveFileNoExt, formatBinary, **kwargs):
-        points_per_side = 32
-        if kwargs.get("segRes") == "Low":
-            points_per_side = 16
-        elif kwargs.get("segRes") == "High":
-            points_per_side = 64
+        points_per_side = POINTS_PER_SIDE_BY_RES.get(
+            kwargs.get("segRes"), DEFAULT_POINTS_PER_SIDE
+        )
         mask_generator = SAM2AutomaticMaskGenerator(
             model=sam,
             points_per_side=points_per_side,
             crop_n_layers=kwargs.get("cropNLayers", 0),
             min_mask_region_area=kwargs.get("minMaskArea", 0),
         )
-        masks = mask_generator.generate(cvImage)
+        with heartbeat(f"segmenting (grid {points_per_side}x{points_per_side})"):
+            masks = mask_generator.generate(cvImage)
         masks = [mask["segmentation"] for mask in masks]
         saveMasks(masks, saveFileNoExt, formatBinary)
 
@@ -339,6 +433,7 @@ def main():
         )
         return
 
+    t_start = time.time()
     modelType = sys.argv[1]
     checkPtFilePath = sys.argv[2]
     model_filename = os.path.basename(checkPtFilePath)
@@ -363,13 +458,14 @@ def main():
         print(f"Error: Checkpoint file not found: {checkPtFilePath}")
         return
 
-    sam = strategy.load_model(checkPtFilePath, modelType)
+    device, device_desc = pick_device()
+    print(f"Using device: {device_desc}", flush=True)
+
+    stage("loading_model")
+    with heartbeat("loading model"):
+        sam = strategy.load_model(checkPtFilePath, modelType, device)
     if sam is None:
         return
-
-    if torch.cuda.is_available():
-        sam.to(device="cuda")
-        print("Model moved to CUDA")
 
     if len(sys.argv) == 3:
         strategy.run_test(sam)
@@ -383,22 +479,68 @@ def main():
     saveFileNoExt = sys.argv[6]
     formatBinary = sys.argv[7] == "True" if len(sys.argv) > 7 else True
 
+    stage("reading_image")
     cvImage = cv2.imread(ipFile)
     cvImage = cv2.cvtColor(cvImage, cv2.COLOR_BGR2RGB)
 
     try:
         if segType == "Auto":
             auto_kwargs = {}
-            if isinstance(strategy, SAM2Strategy):
-                if len(sys.argv) > 8:
-                    auto_kwargs["segRes"] = sys.argv[8]
-                if len(sys.argv) > 9:
-                    auto_kwargs["cropNLayers"] = int(sys.argv[9])
-                if len(sys.argv) > 10:
-                    auto_kwargs["minMaskArea"] = int(sys.argv[10])
-            strategy.segment_auto(
-                sam, cvImage, saveFileNoExt, formatBinary, **auto_kwargs
-            )
+            if len(sys.argv) > 8:
+                auto_kwargs["segRes"] = sys.argv[8]
+            if len(sys.argv) > 9:
+                auto_kwargs["cropNLayers"] = int(sys.argv[9])
+            if len(sys.argv) > 10:
+                auto_kwargs["minMaskArea"] = int(sys.argv[10])
+            maxAutoDim = int(sys.argv[11]) if len(sys.argv) > 11 else 0
+
+            originalShape = cvImage.shape[:2]  # (h, w)
+            workImage = cvImage
+            if maxAutoDim > 0 and max(originalShape) > maxAutoDim:
+                scale = maxAutoDim / max(originalShape)
+                newSize = (
+                    max(1, int(round(originalShape[1] * scale))),
+                    max(1, int(round(originalShape[0] * scale))),
+                )
+                print(
+                    f"Downscaling {originalShape[1]}x{originalShape[0]} -> "
+                    f"{newSize[0]}x{newSize[1]} for a faster Auto pass "
+                    "(masks are upscaled back before saving)",
+                    flush=True,
+                )
+                workImage = cv2.resize(cvImage, newSize, interpolation=cv2.INTER_AREA)
+
+            stage("segmenting")
+            if workImage is cvImage:
+                strategy.segment_auto(
+                    sam, workImage, saveFileNoExt, formatBinary, **auto_kwargs
+                )
+            else:
+                # Segment at the reduced resolution, then upscale each mask
+                # back to the original image size before persisting it.
+                import tempfile as _tempfile
+
+                tmpPrefix = saveFileNoExt + "__lowres__"
+                strategy.segment_auto(
+                    sam, workImage, tmpPrefix, formatBinary=False, **auto_kwargs
+                )
+                idx = 0
+                while True:
+                    lowResPath = tmpPrefix + str(idx) + ".seg"
+                    if not os.path.exists(lowResPath):
+                        break
+                    with open(lowResPath, "r") as f:
+                        rows = [
+                            [c == "1" for c in line.rstrip("\n")]
+                            for line in f.readlines()
+                        ]
+                    os.remove(lowResPath)
+                    lowResMask = np.array(rows, dtype=bool)
+                    fullResMask = resizeMaskToOriginal(lowResMask, originalShape)
+                    saveMask(
+                        saveFileNoExt + str(idx) + ".seg", fullResMask, formatBinary
+                    )
+                    idx += 1
         elif segType in {"Selection", "Box-Selection"}:
             selFile = sys.argv[8]
             boxCos = (
@@ -406,21 +548,24 @@ def main():
                 if len(sys.argv) > 9
                 else None
             )
-            strategy.segment_sel(
-                sam, cvImage, maskType, selFile, boxCos, saveFileNoExt, formatBinary
-            )
+            stage("segmenting")
+            with heartbeat("segmenting selection"):
+                strategy.segment_sel(
+                    sam, cvImage, maskType, selFile, boxCos, saveFileNoExt, formatBinary
+                )
         elif segType == "Box":
             boxCos = [float(val.strip()) for val in sys.argv[9].split(",")]
-            strategy.segment_box(
-                sam, cvImage, maskType, boxCos, saveFileNoExt, formatBinary
-            )
+            stage("segmenting")
+            with heartbeat("segmenting box"):
+                strategy.segment_box(
+                    sam, cvImage, maskType, boxCos, saveFileNoExt, formatBinary
+                )
         else:
             print(f"Unknown segmentation type: {segType}")
     finally:
-        print("Done!")
+        print(f"Done! (total {time.time() - t_start:.1f}s)", flush=True)
         strategy.cleanup()
 
 
 if __name__ == "__main__":
     main()
-

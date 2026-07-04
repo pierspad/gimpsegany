@@ -19,6 +19,7 @@ from gi.repository import GLib
 
 import tempfile
 import subprocess
+import threading
 from os.path import exists
 from array import array
 import random
@@ -31,6 +32,54 @@ import logging
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk
+
+# ---------------------------------------------------------------------------
+# LazyGimp backend auto-discovery.
+#
+# LazyGimp (a companion installer) sets up a dedicated venv + downloads a SAM
+# checkpoint under ~/.local/share/lazygimp/segany/. When that's present, the
+# plug-in should never leave the user staring at two empty file choosers —
+# it already knows exactly where the interpreter and the models are. This is
+# what makes the dialog "just work" on first run without ever making the
+# user hunt for paths.
+# ---------------------------------------------------------------------------
+
+LAZYGIMP_BACKEND_DIR = os.path.expanduser("~/.local/share/lazygimp/segany")
+
+MODEL_FRIENDLY_LABELS = {
+    "sam_vit_b_01ec64": "SAM1 · vit_b — leggero, veloce su CPU",
+    "sam_vit_l_0b3195": "SAM1 · vit_l — bilanciato (consigliato)",
+    "sam_vit_h_4b8939": "SAM1 · vit_h — qualità massima, lento su CPU",
+    "sam2_hiera_tiny": "SAM2 · tiny — sperimentale",
+    "sam2_hiera_small": "SAM2 · small — sperimentale",
+    "sam2_hiera_base_plus": "SAM2 · base+ — sperimentale",
+    "sam2_hiera_large": "SAM2 · large — sperimentale, pesante",
+}
+
+
+def discover_lazygimp_backend():
+    """Return (python_path_or_None, [checkpoint paths...]) from the LazyGimp
+    managed backend directory, if it exists. Never raises."""
+    python_path = None
+    models = []
+    try:
+        venv_python = os.path.join(LAZYGIMP_BACKEND_DIR, "venv", "bin", "python3")
+        if os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
+            python_path = venv_python
+        models_dir = os.path.join(LAZYGIMP_BACKEND_DIR, "models")
+        if os.path.isdir(models_dir):
+            for fname in sorted(os.listdir(models_dir)):
+                if fname.lower().endswith((".pth", ".pt", ".safetensors")):
+                    models.append(os.path.join(models_dir, fname))
+    except OSError as e:
+        logging.info("LazyGimp backend discovery failed: %s", e)
+    return python_path, models
+
+
+def model_friendly_label(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    label = MODEL_FRIENDLY_LABELS.get(stem)
+    return f"{label}  ({os.path.basename(path)})" if label else os.path.basename(path)
 
 
 class DialogValue:
@@ -48,6 +97,11 @@ class DialogValue:
         self.segRes = "Medium"
         self.cropNLayers = 0
         self.minMaskArea = 0
+        # 0 = no downscale. Auto-mode's cost is dominated by points-per-side,
+        # not resolution, but very large photos still pay a real cost in
+        # mask post-processing/upscaling, so this remains a useful knob for
+        # power users — see seganybridge.py for the actual math.
+        self.maxAutoDim = 1024
 
         try:
             with open(filepath, "r") as f:
@@ -63,6 +117,7 @@ class DialogValue:
                 self.segRes = data.get("segRes", self.segRes)
                 self.cropNLayers = data.get("cropNLayers", self.cropNLayers)
                 self.minMaskArea = data.get("minMaskArea", self.minMaskArea)
+                self.maxAutoDim = data.get("maxAutoDim", self.maxAutoDim)
         except Exception as e:
             logging.info("Error reading json : %s" % e)
 
@@ -79,6 +134,7 @@ class DialogValue:
             "segRes": self.segRes,
             "cropNLayers": self.cropNLayers,
             "minMaskArea": self.minMaskArea,
+            "maxAutoDim": self.maxAutoDim,
         }
         with open(filepath, "w") as f:
             json.dump(data, f)
@@ -91,7 +147,7 @@ class OptionsDialog(Gtk.Dialog):
             Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK
         )
 
-        self.set_default_size(400, 200)
+        self.set_default_size(440, 240)
 
         self.boxPathNames = sorted(boxPathDict.keys())
         boxPathExist = len(self.boxPathNames) > 0
@@ -100,25 +156,123 @@ class OptionsDialog(Gtk.Dialog):
         self.configFilePath = os.path.join(scriptDir, "segany_settings.json")
 
         self.values = DialogValue(self.configFilePath)
+        self._discovered_python, self._discovered_models = discover_lazygimp_backend()
 
+        outer = self.get_content_area()
+        outer.set_spacing(8)
+        outer.set_border_width(4)
+
+        # ------------------------------------------------------------------
+        # Simple section — everything a first-time user needs, nothing else.
+        # ------------------------------------------------------------------
         grid = Gtk.Grid()
         grid.set_column_spacing(10)
         grid.set_row_spacing(10)
         grid.set_margin_start(10)
         grid.set_margin_end(10)
         grid.set_margin_top(10)
-        grid.set_margin_bottom(10)
-        self.get_content_area().add(grid)
+        grid.set_margin_bottom(6)
+        outer.add(grid)
 
-        # Python Path
+        row = 0
+
+        # Model — auto-discovered from the LazyGimp backend, or a single
+        # "current configuration" entry if the plug-in was set up by hand.
+        self.modelLbl = Gtk.Label(label="Model:", xalign=1)
+        self.modelCombo = Gtk.ComboBoxText()
+        self._model_paths = []  # combo index -> checkpoint path
+
+        self.noModelHintLbl = Gtk.Label(xalign=0)
+        self.noModelHintLbl.set_line_wrap(True)
+        self.noModelHintLbl.set_markup(
+            "<small>Nessun modello trovato automaticamente. Installane uno con "
+            "LazyGimp, oppure specifica i percorsi qui sotto in "
+            "<b>Modalità Esperto</b>.</small>"
+        )
+
+        self._populate_model_combo()
+        grid.attach(self.modelLbl, 0, row, 1, 1)
+        grid.attach(self.modelCombo, 1, row, 1, 1)
+        row += 1
+
+        grid.attach(self.noModelHintLbl, 0, row, 2, 1)
+        row += 1
+
+        # Segmentation Type
+        segTypeLbl = Gtk.Label(label="Segmentation Type:", xalign=1)
+        self.segTypeDropDown = Gtk.ComboBoxText()
+        self.segTypeVals = ["Auto", "Box", "Selection"]
+        for value in self.segTypeVals:
+            self.segTypeDropDown.append_text(value)
+        self.segTypeDropDown.set_active(self.segTypeVals.index(self.values.segType))
+        grid.attach(segTypeLbl, 0, row, 1, 1)
+        grid.attach(self.segTypeDropDown, 1, row, 1, 1)
+        row += 1
+
+        # Selection Points
+        self.selPtsLbl = Gtk.Label(label="Selection Points:", xalign=1)
+        self.selPtsEntry = Gtk.Entry()
+        self.selPtsEntry.set_text(str(self.values.selPtCnt))
+        grid.attach(self.selPtsLbl, 0, row, 1, 1)
+        grid.attach(self.selPtsEntry, 1, row, 1, 1)
+        row += 1
+
+        # Mask Type
+        self.maskTypeLbl = Gtk.Label(label="Mask Type:", xalign=1)
+        self.maskTypeDropDown = Gtk.ComboBoxText()
+        self.maskTypeVals = ["Multiple", "Single"]
+        for value in self.maskTypeVals:
+            self.maskTypeDropDown.append_text(value)
+        self.maskTypeDropDown.set_active(self.maskTypeVals.index(self.values.maskType))
+        grid.attach(self.maskTypeLbl, 0, row, 1, 1)
+        grid.attach(self.maskTypeDropDown, 1, row, 1, 1)
+        row += 1
+
+        if not self.isGrayScale:
+            self.randColBtn = Gtk.CheckButton(label="Random Mask Color")
+            self.randColBtn.set_active(self.values.isRandomColor)
+            grid.attach(self.randColBtn, 1, row, 1, 1)
+            row += 1
+
+            self.maskColorLbl = Gtk.Label(label="Mask Color:", xalign=1)
+            self.maskColorBtn = Gtk.ColorButton()
+            rgba = Gdk.RGBA()
+            rgba.parse(
+                f"rgb({self.values.maskColor[0]},{self.values.maskColor[1]},{self.values.maskColor[2]})"
+            )
+            self.maskColorBtn.set_rgba(rgba)
+            grid.attach(self.maskColorLbl, 0, row, 1, 1)
+            grid.attach(self.maskColorBtn, 1, row, 1, 1)
+            row += 1
+
+        # ------------------------------------------------------------------
+        # Expert mode — collapsed by default. Raw paths, model-family
+        # override, and the numeric SAM2/SAM1 auto-segmentation tuning that
+        # only matters to someone who already knows what it does.
+        # ------------------------------------------------------------------
+        self.expertExpander = Gtk.Expander(label="Modalità Esperto")
+        outer.add(self.expertExpander)
+
+        egrid = Gtk.Grid()
+        egrid.set_column_spacing(10)
+        egrid.set_row_spacing(8)
+        egrid.set_margin_start(10)
+        egrid.set_margin_end(10)
+        egrid.set_margin_top(8)
+        egrid.set_margin_bottom(8)
+        self.expertExpander.add(egrid)
+
+        erow = 0
+
         pythonFileLbl = Gtk.Label(label="Python3 Path:", xalign=1)
         self.pythonFileBtn = Gtk.FileChooserButton(title="Select Python Path")
-        if self.values.pythonPath is not None:
-            self.pythonFileBtn.set_filename(self.values.pythonPath)
-        grid.attach(pythonFileLbl, 0, 0, 1, 1)
-        grid.attach(self.pythonFileBtn, 1, 0, 1, 1)
+        pre_python = self.values.pythonPath or self._discovered_python
+        if pre_python is not None:
+            self.pythonFileBtn.set_filename(pre_python)
+        egrid.attach(pythonFileLbl, 0, erow, 1, 1)
+        egrid.attach(self.pythonFileBtn, 1, erow, 1, 1)
+        erow += 1
 
-        # Model Type
         modelTypeLbl = Gtk.Label(label="Model Type:", xalign=1)
         self.modelTypeDropDown = Gtk.ComboBoxText()
         self.modelTypeVals = [
@@ -133,17 +287,15 @@ class OptionsDialog(Gtk.Dialog):
         ]
         for value in self.modelTypeVals:
             self.modelTypeDropDown.append_text(value)
-
         try:
             active_index = self.modelTypeVals.index(self.values.modelType)
         except ValueError:
-            active_index = 0  # Default to Auto
+            active_index = 0
         self.modelTypeDropDown.set_active(active_index)
+        egrid.attach(modelTypeLbl, 0, erow, 1, 1)
+        egrid.attach(self.modelTypeDropDown, 1, erow, 1, 1)
+        erow += 1
 
-        grid.attach(modelTypeLbl, 0, 1, 1, 1)
-        grid.attach(self.modelTypeDropDown, 1, 1, 1, 1)
-
-        # Checkpoint Path
         checkPtFileLbl = Gtk.Label(
             label="Model Checkpoint (.pth/.safetensors):", xalign=1
         )
@@ -152,82 +304,91 @@ class OptionsDialog(Gtk.Dialog):
         )
         if self.values.checkPtPath is not None:
             self.checkPtFileBtn.set_filename(self.values.checkPtPath)
-        grid.attach(checkPtFileLbl, 0, 2, 1, 1)
-        grid.attach(self.checkPtFileBtn, 1, 2, 1, 1)
+        egrid.attach(checkPtFileLbl, 0, erow, 1, 1)
+        egrid.attach(self.checkPtFileBtn, 1, erow, 1, 1)
+        erow += 1
 
-        # Segmentation Type
-        segTypeLbl = Gtk.Label(label="Segmentation Type:", xalign=1)
-        self.segTypeDropDown = Gtk.ComboBoxText()
-        self.segTypeVals = ["Auto", "Box", "Selection"]
-        for value in self.segTypeVals:
-            self.segTypeDropDown.append_text(value)
-        self.segTypeDropDown.set_active(self.segTypeVals.index(self.values.segType))
-        grid.attach(segTypeLbl, 0, 3, 1, 1)
-        grid.attach(self.segTypeDropDown, 1, 3, 1, 1)
-
-        # Mask Type
-        self.maskTypeLbl = Gtk.Label(label="Mask Type:", xalign=1)
-        self.maskTypeDropDown = Gtk.ComboBoxText()
-        self.maskTypeVals = ["Multiple", "Single"]
-        for value in self.maskTypeVals:
-            self.maskTypeDropDown.append_text(value)
-        self.maskTypeDropDown.set_active(self.maskTypeVals.index(self.values.maskType))
-        grid.attach(self.maskTypeLbl, 0, 4, 1, 1)
-        grid.attach(self.maskTypeDropDown, 1, 4, 1, 1)
-
-        # Selection Points
-        self.selPtsLbl = Gtk.Label(label="Selection Points:", xalign=1)
-        self.selPtsEntry = Gtk.Entry()
-        self.selPtsEntry.set_text(str(self.values.selPtCnt))
-        grid.attach(self.selPtsLbl, 0, 5, 1, 1)
-        grid.attach(self.selPtsEntry, 1, 5, 1, 1)
-
-        # SAM2 Specific Auto-Segmentation Options
         self.segResLbl = Gtk.Label(label="Segmentation Resolution:", xalign=1)
         self.segResDropDown = Gtk.ComboBoxText()
         self.segResVals = ["Low", "Medium", "High"]
         for value in self.segResVals:
             self.segResDropDown.append_text(value)
         self.segResDropDown.set_active(self.segResVals.index(self.values.segRes))
-        grid.attach(self.segResLbl, 0, 6, 1, 1)
-        grid.attach(self.segResDropDown, 1, 6, 1, 1)
+        egrid.attach(self.segResLbl, 0, erow, 1, 1)
+        egrid.attach(self.segResDropDown, 1, erow, 1, 1)
+        erow += 1
 
         self.cropNLayersLbl = Gtk.Label(label="Crop n Layers:", xalign=1)
         self.cropNLayersChk = Gtk.CheckButton()
         self.cropNLayersChk.set_active(self.values.cropNLayers > 0)
-        grid.attach(self.cropNLayersLbl, 0, 7, 1, 1)
-        grid.attach(self.cropNLayersChk, 1, 7, 1, 1)
+        egrid.attach(self.cropNLayersLbl, 0, erow, 1, 1)
+        egrid.attach(self.cropNLayersChk, 1, erow, 1, 1)
+        erow += 1
 
         self.minMaskAreaLbl = Gtk.Label(label="Minimum Mask Area:", xalign=1)
         self.minMaskAreaEntry = Gtk.Entry()
         self.minMaskAreaEntry.set_text(str(self.values.minMaskArea))
-        grid.attach(self.minMaskAreaLbl, 0, 8, 1, 1)
-        grid.attach(self.minMaskAreaEntry, 1, 8, 1, 1)
+        egrid.attach(self.minMaskAreaLbl, 0, erow, 1, 1)
+        egrid.attach(self.minMaskAreaEntry, 1, erow, 1, 1)
+        erow += 1
 
-        # Mask Color
-        if not self.isGrayScale:
-            self.randColBtn = Gtk.CheckButton(label="Random Mask Color")
-            self.randColBtn.set_active(self.values.isRandomColor)
-            grid.attach(self.randColBtn, 1, 9, 1, 1)
+        self.maxAutoDimLbl = Gtk.Label(label="Max resolution for Auto (0 = nessun limite):", xalign=1)
+        self.maxAutoDimSpin = Gtk.SpinButton()
+        self.maxAutoDimSpin.set_range(0, 8192)
+        self.maxAutoDimSpin.set_increments(128, 512)
+        self.maxAutoDimSpin.set_value(self.values.maxAutoDim)
+        egrid.attach(self.maxAutoDimLbl, 0, erow, 1, 1)
+        egrid.attach(self.maxAutoDimSpin, 1, erow, 1, 1)
+        erow += 1
 
-            self.maskColorLbl = Gtk.Label(label="Mask Color:", xalign=1)
-            self.maskColorBtn = Gtk.ColorButton()
-            rgba = Gdk.RGBA()
-            rgba.parse(
-                f"rgb({self.values.maskColor[0]},{self.values.maskColor[1]},{self.values.maskColor[2]})"
-            )
-            self.maskColorBtn.set_rgba(rgba)
-            grid.attach(self.maskColorLbl, 0, 10, 1, 1)
-            grid.attach(self.maskColorBtn, 1, 10, 1, 1)
+        # Open Expert mode by default only if we have nothing to offer in
+        # Simple mode — otherwise stay out of the way.
+        self.expertExpander.set_expanded(len(self._discovered_models) == 0 and not self.values.checkPtPath)
 
         self.connect("map-event", self.on_map_event)
         self.segTypeDropDown.connect("changed", self.update_options_visibility)
         self.modelTypeDropDown.connect("changed", self.update_options_visibility)
+        self.modelCombo.connect("changed", self.on_model_combo_changed)
         self.checkPtFileBtn.connect("file-set", self.update_options_visibility)
         if not self.isGrayScale:
             self.randColBtn.connect("toggled", self.on_random_toggled)
 
         self.show_all()
+
+    def _populate_model_combo(self):
+        self._model_paths = []
+        current = self.values.checkPtPath
+        current_is_discovered = current in self._discovered_models
+
+        if current and not current_is_discovered:
+            self.modelCombo.append_text(f"Attuale: {os.path.basename(current)}")
+            self._model_paths.append(current)
+
+        for path in self._discovered_models:
+            self.modelCombo.append_text(model_friendly_label(path))
+            self._model_paths.append(path)
+
+        has_models = len(self._model_paths) > 0
+        self.modelCombo.set_visible(has_models)
+        self.modelLbl.set_visible(has_models)
+        self.noModelHintLbl.set_visible(not has_models)
+
+        if has_models:
+            if current in self._model_paths:
+                self.modelCombo.set_active(self._model_paths.index(current))
+            else:
+                self.modelCombo.set_active(0)
+
+    def on_model_combo_changed(self, widget):
+        idx = self.modelCombo.get_active()
+        if idx < 0 or idx >= len(self._model_paths):
+            return
+        path = self._model_paths[idx]
+        self.checkPtFileBtn.set_filename(path)
+        self.modelTypeDropDown.set_active(0)  # "Auto" — inferred from filename
+        if not self.pythonFileBtn.get_filename() and self._discovered_python:
+            self.pythonFileBtn.set_filename(self._discovered_python)
+        self.update_options_visibility(None)
 
     def update_options_visibility(self, widget):
         segType = self.segTypeVals[self.segTypeDropDown.get_active()]
@@ -235,7 +396,6 @@ class OptionsDialog(Gtk.Dialog):
 
         isAuto = segType == "Auto"
 
-        # Determine if SAM1 is being used
         checkpoint_path = self.checkPtFileBtn.get_filename()
         isSam1_by_filename = (
             modelType == "Auto"
@@ -250,14 +410,16 @@ class OptionsDialog(Gtk.Dialog):
         self.maskTypeLbl.set_visible(segType not in ["Auto"])
         self.maskTypeDropDown.set_visible(segType not in ["Auto"])
 
-        # Show SAM2-specific options only for Auto mode and not SAM1
-        show_sam2_options = isAuto and not isSam1
-        self.segResLbl.set_visible(show_sam2_options)
-        self.segResDropDown.set_visible(show_sam2_options)
-        self.cropNLayersLbl.set_visible(show_sam2_options)
-        self.cropNLayersChk.set_visible(show_sam2_options)
-        self.minMaskAreaLbl.set_visible(show_sam2_options)
-        self.minMaskAreaEntry.set_visible(show_sam2_options)
+        # Both SAM1 and SAM2 honour these now; only hide them outside Auto.
+        show_auto_options = isAuto
+        self.segResLbl.set_visible(show_auto_options)
+        self.segResDropDown.set_visible(show_auto_options)
+        self.cropNLayersLbl.set_visible(show_auto_options)
+        self.cropNLayersChk.set_visible(show_auto_options)
+        self.minMaskAreaLbl.set_visible(show_auto_options)
+        self.minMaskAreaEntry.set_visible(show_auto_options)
+        self.maxAutoDimLbl.set_visible(show_auto_options)
+        self.maxAutoDimSpin.set_visible(show_auto_options)
 
     def on_random_toggled(self, widget):
         is_random = self.randColBtn.get_active()
@@ -271,10 +433,7 @@ class OptionsDialog(Gtk.Dialog):
 
     def get_values(self):
         self.values.pythonPath = self.pythonFileBtn.get_filename()
-
-        # Persist the full model type string for UI restoration
         self.values.modelType = self.modelTypeVals[self.modelTypeDropDown.get_active()]
-
         self.values.checkPtPath = self.checkPtFileBtn.get_filename()
         self.values.segType = self.segTypeVals[self.segTypeDropDown.get_active()]
         self.values.maskType = self.maskTypeVals[self.maskTypeDropDown.get_active()]
@@ -291,9 +450,9 @@ class OptionsDialog(Gtk.Dialog):
         self.values.segRes = self.segResVals[self.segResDropDown.get_active()]
         self.values.cropNLayers = 1 if self.cropNLayersChk.get_active() else 0
         self.values.minMaskArea = int(self.minMaskAreaEntry.get_text())
+        self.values.maxAutoDim = int(self.maxAutoDimSpin.get_value())
         self.values.persist(self.configFilePath)
 
-        # Return a copy with the parsed model type for the bridge script
         run_values = self.values
         if run_values.modelType == "Auto":
             run_values.modelType = "auto"
@@ -305,48 +464,6 @@ class OptionsDialog(Gtk.Dialog):
 
 def getPathDict(image):
     return {}
-
-
-def shellRun(cmdArgs, stdoutFile=None, env_vars=None, useos=False):
-    if env_vars is None:
-        env_vars = os.environ.copy()
-
-    cmdLine = " ".join(cmdArgs)
-    logging.info("Running command: %s" % cmdLine)
-    if useos:
-        os.system(cmdLine)
-    else:
-        process = subprocess.Popen(
-            cmdArgs,
-            env=env_vars,
-            stdout=subprocess.PIPE if not stdoutFile else stdoutFile,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            # Processing stdout
-            if process.stdout:
-                for line in iter(process.stdout.readline, b""):
-                    # Decode the line if necessary (Python 3 reads bytes from PIPE)
-                    line = line.decode("utf-8")
-                    print(
-                        line,
-                    )
-            process.wait()
-
-            if process.returncode != 0:
-                error_message = "Command failed with the following error:\n "
-                error_lines = [
-                    line.decode("utf-8") for line in iter(process.stderr.readline, b"")
-                ]
-                logging.error(error_message + "".join(error_lines))
-                return False
-
-        finally:
-            if process.stdout:
-                process.stdout.close()
-            if process.stderr:
-                process.stderr.close()
-    return True
 
 
 def unpackBoolArray(filepath):
@@ -537,6 +654,12 @@ def showError(message):
 
 
 def validateOptions(image, values):
+    if values.checkPtPath is None:
+        showError(
+            "Nessun modello Segment Anything configurato. Installane uno con "
+            "LazyGimp oppure impostalo manualmente in Modalità Esperto."
+        )
+        return False
     if values.segType in {"Selection", "Box"}:
         procedure = Gimp.get_pdb().lookup_procedure("gimp-selection-is-empty")
         config = procedure.create_config()
@@ -561,19 +684,114 @@ def configLogging(level):
     )
 
 
+class ProgressDialog(Gtk.Dialog):
+    """Non-blocking-looking progress window for the bridge subprocess.
+
+    GIMP never calls a plug-in on more than one thread, and there is no
+    active GLib main loop iterating while our run() callback is on the
+    stack — so simply doing `dialog.show_all()` would draw a dialog that
+    never repaints or responds to clicks. We run our own nested
+    GLib.MainLoop() to pump GTK events while a background thread waits on
+    the actual subprocess; that keeps the window alive, the pulse animating
+    and Cancel clickable, all without blocking on the AI workload itself.
+    """
+
+    def __init__(self):
+        Gtk.Dialog.__init__(
+            self,
+            title="Segment Anything — elaborazione in corso",
+            transient_for=None,
+            flags=Gtk.DialogFlags.MODAL,
+        )
+        self.set_default_size(440, 120)
+        self.set_deletable(False)
+
+        box = self.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(14)
+
+        self.label = Gtk.Label(label="Avvio…")
+        self.label.set_line_wrap(True)
+        self.label.set_xalign(0)
+        box.add(self.label)
+
+        self.bar = Gtk.ProgressBar()
+        box.add(self.bar)
+
+        self.add_button("Annulla", Gtk.ResponseType.CANCEL)
+
+        self._pulse_id = GLib.timeout_add(150, self._pulse)
+        self.show_all()
+
+    def _pulse(self):
+        self.bar.pulse()
+        return True
+
+    def set_status(self, text):
+        self.label.set_text(text)
+        return False
+
+    def teardown(self):
+        if self._pulse_id is not None:
+            GLib.source_remove(self._pulse_id)
+            self._pulse_id = None
+        self.destroy()
+        return False
+
+
+def run_bridge_with_progress(cmd):
+    """Run the bridge subprocess in a background thread while keeping the
+    GIMP UI responsive via a nested main loop. Returns (returncode, cancelled).
+    """
+    progress = ProgressDialog()
+    loop = GLib.MainLoop()
+    state = {"cancelled": False, "returncode": None}
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=os.environ.copy(),
+    )
+
+    def on_response(dialog, response_id):
+        if response_id == Gtk.ResponseType.CANCEL and not state["cancelled"]:
+            state["cancelled"] = True
+            logging.warning("Segmentation cancelled by the user — terminating bridge")
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    progress.connect("response", on_response)
+
+    def reader():
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                line = line.rstrip("\n")
+                if line:
+                    logging.debug(line)
+                    GLib.idle_add(progress.set_status, line)
+        finally:
+            proc.wait()
+            state["returncode"] = proc.returncode
+            GLib.idle_add(loop.quit)
+
+    threading.Thread(target=reader, daemon=True).start()
+    loop.run()
+    progress.teardown()
+    return state["returncode"], state["cancelled"]
+
+
 def run_segmentation(image, values):
     configLogging(logging.DEBUG)
     if not validateOptions(image, values):
         return
 
-    boxPathDict = getPathDict(image)
-
-    if values.checkPtPath is None:
-        logging.error("Please set the Segment Anything checkpoint path.")
-        return
-
     if values.pythonPath is None:
-        logging.warn("Warning: python path is None trying default python executable")
+        logging.warning("Warning: python path is None, trying default python executable")
         pythonPath = "python"
     else:
         pythonPath = values.pythonPath
@@ -606,19 +824,14 @@ def run_segmentation(image, values):
     ]
 
     if values.segType == "Auto":
-        # Only add SAM2-specific args if the model is not SAM1
-        # The bridge script knows to ignore them, but this is cleaner.
-        isSam1_by_type = values.modelType in ["vit_h", "vit_l", "vit_b"]
-        isSam1_by_filename = (
-            values.modelType == "auto"
-            and values.checkPtPath
-            and os.path.basename(values.checkPtPath).lower().startswith("sam_")
+        cmd.extend(
+            [
+                values.segRes,
+                str(values.cropNLayers),
+                str(values.minMaskArea),
+                str(values.maxAutoDim),
+            ]
         )
-        isSam1 = isSam1_by_type or isSam1_by_filename
-        if not isSam1:
-            cmd.extend(
-                [values.segRes, str(values.cropNLayers), str(values.minMaskArea)]
-            )
 
     newImage = image.duplicate()
     visLayer = newImage.merge_visible_layers(Gimp.MergeType.CLIP_TO_IMAGE)
@@ -667,7 +880,24 @@ def run_segmentation(image, values):
     config = procedure.create_config()
     config.set_property("image", image)
     procedure.run(config)
-    shellRun(cmd)
+
+    # Everything above is GIMP-PDB work and has to happen on this thread.
+    # The bridge subprocess is the only genuinely slow, GIMP-independent
+    # part — that's what runs in the background while a progress dialog
+    # keeps the user informed instead of GIMP looking hung.
+    returncode, cancelled = run_bridge_with_progress(cmd)
+
+    if cancelled:
+        cleanup(filepathPrefix)
+        return
+
+    if returncode != 0:
+        showError(
+            "La segmentazione non è riuscita. Controlla la Console degli errori "
+            "di GIMP per i dettagli del bridge Python."
+        )
+        cleanup(filepathPrefix)
+        return
 
     layerMaskColor = None if values.isRandomColor else values.maskColor
     createLayers(image, maskFileNoExt, layerMaskColor, formatBinary, values)
@@ -682,6 +912,48 @@ def run_segmentation(image, values):
         procedure.run(config)
 
     logging.debug("Finished creating segments!")
+
+
+def values_from_config(config, configFilePath):
+    """Build a DialogValue from PDB procedure arguments, falling back to the
+    persisted/discovered settings for anything left at its GObject default —
+    this is what makes the plug-in scriptable (Script-Fu, batch mode, our own
+    headless test harness) without ever requiring the interactive dialog."""
+    values = DialogValue(configFilePath)
+    python_default, models_default = discover_lazygimp_backend()
+
+    def prop(name, fallback):
+        try:
+            val = config.get_property(name)
+        except Exception:
+            return fallback
+        if val is None or val == "":
+            return fallback
+        return val
+
+    values.pythonPath = prop("python-path", values.pythonPath or python_default)
+    values.checkPtPath = prop(
+        "checkpoint-path",
+        values.checkPtPath or (models_default[0] if models_default else None),
+    )
+    values.modelType = prop("model-type", values.modelType)
+    values.segType = prop("seg-type", values.segType)
+    values.maskType = prop("mask-type", values.maskType)
+    values.selPtCnt = int(prop("sel-pt-cnt", values.selPtCnt))
+    values.segRes = prop("seg-res", values.segRes)
+    values.cropNLayers = int(prop("crop-n-layers", values.cropNLayers))
+    values.minMaskArea = int(prop("min-mask-area", values.minMaskArea))
+    values.maxAutoDim = int(prop("max-auto-dim", values.maxAutoDim))
+    try:
+        values.isRandomColor = bool(config.get_property("is-random-color"))
+    except Exception:
+        pass
+
+    if values.modelType == "Auto":
+        values.modelType = "auto"
+    else:
+        values.modelType = values.modelType.split(" ")[0]
+    return values
 
 
 class SegAnyPlugin(Gimp.PlugIn):
@@ -699,20 +971,52 @@ class SegAnyPlugin(Gimp.PlugIn):
         procedure.set_menu_label("Segment Anything Layers")
         procedure.set_attribution("Shrinivas Kulkarni", "Shrinivas Kulkarni", "2024")
         procedure.add_menu_path("<Image>/Image")
+
+        # PDB arguments mirror the dialog's fields. This makes the plug-in
+        # fully scriptable (Script-Fu / Python-Fu / batch mode) and is what
+        # lets an automated test harness drive it headlessly, without ever
+        # touching the interactive dialog — pass run-mode NONINTERACTIVE and
+        # whatever arguments matter; anything left blank/zero falls back to
+        # the persisted settings or the LazyGimp auto-discovered backend.
+        flags = GObject.ParamFlags.READWRITE
+        procedure.add_string_argument("python-path", "Python path", "Interpreter used to run the bridge (blank = auto-discover)", "", flags)
+        procedure.add_string_argument("checkpoint-path", "Checkpoint path", "SAM checkpoint file (blank = auto-discover)", "", flags)
+        procedure.add_string_argument("model-type", "Model type", "auto/vit_h/vit_l/vit_b/sam2_hiera_*", "Auto", flags)
+        procedure.add_string_argument("seg-type", "Segmentation type", "Auto, Box or Selection", "Auto", flags)
+        procedure.add_string_argument("mask-type", "Mask type", "Multiple or Single", "Multiple", flags)
+        procedure.add_int_argument("sel-pt-cnt", "Selection points", "Sample points for Selection mode", 1, 1000, 10, flags)
+        procedure.add_string_argument("seg-res", "Auto resolution", "Low, Medium or High", "Medium", flags)
+        procedure.add_int_argument("crop-n-layers", "Crop n layers", "0 or 1", 0, 1, 0, flags)
+        procedure.add_int_argument("min-mask-area", "Minimum mask area", "Discard masks smaller than this (px)", 0, 10_000_000, 0, flags)
+        procedure.add_int_argument("max-auto-dim", "Max Auto resolution", "Downscale before Auto segmentation (0 = off)", 0, 8192, 1024, flags)
+        procedure.add_boolean_argument("is-random-color", "Random mask color", "Use a random color per mask layer", False, flags)
+
         return procedure
 
     def seg_any_run(self, procedure, run_mode, image, drawables, config, data):
-        boxPathDict = getPathDict(image)
-        dialog = OptionsDialog(image, boxPathDict)
-        response = dialog.run()
+        scriptDir = os.path.dirname(os.path.abspath(__file__))
+        configFilePath = os.path.join(scriptDir, "segany_settings.json")
 
-        if response == Gtk.ResponseType.OK:
-            values = dialog.get_values()
+        if run_mode == Gimp.RunMode.INTERACTIVE:
+            boxPathDict = getPathDict(image)
+            dialog = OptionsDialog(image, boxPathDict)
+            response = dialog.run()
+
+            if response == Gtk.ResponseType.OK:
+                values = dialog.get_values()
+                image.undo_group_start()
+                run_segmentation(image, values)
+                image.undo_group_end()
+
+            dialog.destroy()
+        else:
+            # NONINTERACTIVE / RUN-WITH-LAST-VALS: no dialog, read everything
+            # from the PDB config (with auto-discovery/persisted settings as
+            # fallback). This is what the headless test harness drives.
+            values = values_from_config(config, configFilePath)
             image.undo_group_start()
             run_segmentation(image, values)
             image.undo_group_end()
-
-        dialog.destroy()
 
         return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
 
